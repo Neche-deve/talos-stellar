@@ -17,6 +17,10 @@ use soroban_sdk::{
 };
 use ttl_manager;
 use pause_control;
+use admin_controls;
+
+// Re-export shared types from admin_controls so the contract ABI is stable.
+pub use admin_controls::{ProposalStatus, TimelockConfig};
 
 // ── Event Schema Version ────────────────────────────────────────────
 
@@ -46,14 +50,9 @@ pub enum AdminAction {
     SetAdmin(Address),
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProposalStatus {
-    Scheduled,
-    Executed,
-    Cancelled,
-}
-
+/// Name-service-specific timelock proposal. Uses the canonical
+/// [`ProposalStatus`] from `admin_controls` and the name-service-local
+/// [`AdminAction`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelockProposal {
@@ -63,13 +62,6 @@ pub struct TimelockProposal {
     pub status: ProposalStatus,
     pub scheduled_at: u64,
     pub scheduled_by: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimelockConfig {
-    pub min_delay: u64,
-    pub grace_period: u64,
 }
 
 /// A narrowly-scoped write path that can be independently paused.
@@ -176,19 +168,15 @@ fn emit_timelock_scheduled(
     eta: u64,
     proposer: Address,
 ) {
-    let topics = (symbol_short!("tl_sch"), proposal_id);
-    env.events()
-        .publish(topics, (action.clone(), eta, proposer));
+    admin_controls::emit_timelock_scheduled_raw(env, proposal_id, action.clone(), eta, proposer);
 }
 
 fn emit_timelock_executed(env: &Env, proposal_id: u64, action: &AdminAction, executor: Address) {
-    let topics = (symbol_short!("tl_exec"), proposal_id);
-    env.events().publish(topics, (action.clone(), executor));
+    admin_controls::emit_timelock_executed_raw(env, proposal_id, action.clone(), executor);
 }
 
 fn emit_timelock_cancelled(env: &Env, proposal_id: u64, action: &AdminAction, canceller: Address) {
-    let topics = (symbol_short!("tl_cnl"), proposal_id);
-    env.events().publish(topics, (action.clone(), canceller));
+    admin_controls::emit_timelock_cancelled_raw(env, proposal_id, action.clone(), canceller);
 }
 
 fn emit_timelock_config_changed(
@@ -197,30 +185,19 @@ fn emit_timelock_config_changed(
     new_min_delay: u64,
     grace_period: u64,
 ) {
-    let topics = (symbol_short!("tl_cfg"),);
-    env.events()
-        .publish(topics, (old_min_delay, new_min_delay, grace_period));
+    admin_controls::emit_timelock_config_changed(env, old_min_delay, new_min_delay, grace_period);
 }
 
 fn emit_pause_set(env: &Env, domain: &PauseDomain, actor: &Address, expires_at: u64) {
-    let topics = (symbol_short!("pause_on"), domain.clone());
-    env.events().publish(topics, (actor.clone(), expires_at));
+    admin_controls::emit_pause_set(env, domain, actor, expires_at);
 }
 
 fn emit_pause_cleared(env: &Env, domain: &PauseDomain, actor: &Address) {
-    let topics = (symbol_short!("pause_off"), domain.clone());
-    env.events().publish(topics, (actor.clone(),));
+    admin_controls::emit_pause_cleared(env, domain, actor);
 }
 
-fn emit_guardian_added(env: &Env, guardian: Address) {
-    let topics = (symbol_short!("guard_add"),);
-    env.events().publish(topics, (guardian,));
-}
-
-fn emit_guardian_removed(env: &Env, guardian: Address) {
-    let topics = (symbol_short!("guard_rem"),);
-    env.events().publish(topics, (guardian,));
-}
+// Guardian event emission is handled inside admin_controls::add_guardian
+// and admin_controls::remove_guardian; no local wrappers needed.
 
 fn emit_name_fee_paid(env: &Env, talos_id: u32, payer: &Address, asset: &Address, fee: i128) {
     let topics = (symbol_short!("name_fee"), talos_id);
@@ -237,7 +214,8 @@ fn get_guardians(e: &Env) -> Vec<Address> {
 }
 
 fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
-    get_guardians(e).iter().any(|g| g == *addr)
+    let guardians = get_guardians(e);
+    admin_controls::is_guardian(&guardians, addr)
 }
 
 /// Evaluate whether `domain` is currently paused, lazily treating an expired
@@ -253,17 +231,9 @@ fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
     }
 }
 
-fn require_not_paused(e: &Env, domain: PauseDomain) {
-    if is_domain_paused(e, &domain) {
-        panic_with_error!(e, ContractError::DomainPaused);
-    }
-}
-
-const DEFAULT_GRACE_PERIOD: u64 = 604_800; // 7 days in seconds
-const MAX_MIN_DELAY: u64 = 2_592_000; // 30 days in seconds
-const MAX_GUARDIAN_PAUSE_SECS: u64 = 604_800; // 7 days — bounds guardian blast radius
-const MAX_ADMIN_PAUSE_SECS: u64 = 2_592_000; // 30 days; 0 (indefinite) is also allowed for admin
-const MAX_GUARDIANS: u32 = 10; // bounds unbounded storage growth
+// DEFAULT_GRACE_PERIOD is used by get_timelock_config; the other constants
+// are handled internally by admin_controls helpers.
+use admin_controls::DEFAULT_GRACE_PERIOD;
 
 // ── Stable interface (v1.x.x) ──────────────────────────────────────
 //
@@ -789,12 +759,7 @@ impl TalosNameService {
             .expect("Admin not configured");
         admin.require_auth();
 
-        if grace_period == 0 {
-            panic!("Grace period must be positive");
-        }
-        if min_delay > MAX_MIN_DELAY {
-            panic!("Min delay exceeds maximum limit");
-        }
+        admin_controls::validate_timelock_config(min_delay, grace_period);
 
         let old_config = Self::get_timelock_config(e.clone());
 
@@ -833,9 +798,7 @@ impl TalosNameService {
         admin.require_auth();
 
         let config = Self::get_timelock_config(e.clone());
-        if delay < config.min_delay {
-            panic!("Delay less than minimum required delay");
-        }
+        admin_controls::validate_delay(delay, &config);
 
         let id: u64 = e
             .storage()
@@ -878,15 +841,8 @@ impl TalosNameService {
             panic!("Proposal not active");
         }
 
-        let now = e.ledger().timestamp();
-        if now < proposal.eta {
-            panic!("Timelock delay not met");
-        }
-
         let config = Self::get_timelock_config(e.clone());
-        if now > proposal.eta.saturating_add(config.grace_period) {
-            panic!("Proposal expired");
-        }
+        admin_controls::validate_executable(&e, proposal.eta, config.grace_period);
 
         match &proposal.action {
             AdminAction::SetRegistryContract(new_registry_id) => {
@@ -979,21 +935,7 @@ impl TalosNameService {
         }
 
         let now = e.ledger().timestamp();
-        let expires_at = if is_admin_caller {
-            if duration == 0 {
-                0
-            } else {
-                if duration > MAX_ADMIN_PAUSE_SECS {
-                    panic_with_error!(&e, ContractError::InvalidPauseDuration);
-                }
-                now.saturating_add(duration)
-            }
-        } else {
-            if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
-                panic_with_error!(&e, ContractError::InvalidPauseDuration);
-            }
-            now.saturating_add(duration)
-        };
+        let expires_at = admin_controls::compute_expires_at(&e, is_admin_caller, duration);
 
         e.storage().persistent().set(
             &key,
@@ -1076,16 +1018,9 @@ impl TalosNameService {
         admin.require_auth();
 
         let mut guardians = get_guardians(&e);
-        if guardians.iter().any(|g| g == guardian) {
-            return;
+        if admin_controls::add_guardian(&e, &mut guardians, guardian) {
+            e.storage().persistent().set(&DataKey::Guardians, &guardians);
         }
-        if guardians.len() >= MAX_GUARDIANS {
-            panic_with_error!(&e, ContractError::GuardianLimitReached);
-        }
-
-        guardians.push_back(guardian.clone());
-        e.storage().persistent().set(&DataKey::Guardians, &guardians);
-        emit_guardian_added(&e, guardian);
     }
 
     /// Revoke a guardian's pause authority. Idempotent.
@@ -1100,23 +1035,10 @@ impl TalosNameService {
             .expect("Admin not configured");
         admin.require_auth();
 
-        let guardians = get_guardians(&e);
-        let mut remaining = Vec::new(&e);
-        let mut found = false;
-        for g in guardians.iter() {
-            if g == guardian {
-                found = true;
-                continue;
-            }
-            remaining.push_back(g);
+        let mut guardians = get_guardians(&e);
+        if admin_controls::remove_guardian(&e, &mut guardians, guardian) {
+            e.storage().persistent().set(&DataKey::Guardians, &guardians);
         }
-
-        if !found {
-            return;
-        }
-
-        e.storage().persistent().set(&DataKey::Guardians, &remaining);
-        emit_guardian_removed(&e, guardian);
     }
 
     /// Check whether `addr` currently holds guardian pause authority.
