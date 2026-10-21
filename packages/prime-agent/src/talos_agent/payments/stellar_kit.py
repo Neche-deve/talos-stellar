@@ -3,22 +3,70 @@
 The Prime Agent never holds Stellar private keys. All on-chain operations
 (balance queries, token transfers, dividends) go through the Talos Web
 server, which uses Stellar SDK server-side or reads from Horizon.
+
+Failures are classified with :mod:`talos_agent.payments.stellar_retry` so that
+callers and operators can decide deterministically whether a transaction is
+safe to retry.  The returned classification is privacy-safe: no exception
+text, seeds, payment proofs, or response bodies are ever surfaced.
 """
 
 from __future__ import annotations
 
 import os
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 from rich.console import Console
+from stellar_sdk import StrKey
 
 from talos_agent.adapters.snapshots import StellarHealthSnapshot
 from talos_agent.http import request_with_retry
+from talos_agent.payments.stellar_retry import (
+    attach_stellar_failure,
+    classify_stellar_failure,
+    classify_stellar_result,
+)
 
 _HORIZON_URL = os.getenv("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org")
+_SEVEN_DECIMALS = Decimal("0.0000001")
+
+#: Default timeout (seconds) for Horizon HTTP requests.
+_DEFAULT_HORIZON_TIMEOUT = 30.0
+
+
+def _validate_account_id(account_id: str) -> bool:
+    """Return True if *account_id* is a valid Stellar account identifier.
+
+    Accepts classic Ed25519 public keys (G…) and muxed accounts (M…).
+    Rejects anything else — empty strings, path-traversal fragments, secret
+    keys, contract IDs, etc. — so that callers never interpolate untrusted
+    input into a Horizon URL.
+    """
+    return StrKey.is_valid_ed25519_public_key(account_id) or StrKey.is_valid_med25519_public_key(account_id)
+
 
 console = Console()
+
+
+def to_stellar_amount(value: Decimal | float | int | str) -> Decimal:
+    """Parse a numeric or string value to Decimal with exact precision.
+
+    Float inputs are converted via str(value) to avoid binary float artifacts
+    where possible, while Decimal and string inputs retain exact precision.
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, str)):
+        return Decimal(str(value).strip())
+    # float input
+    return Decimal(str(value))
+
+
+def format_stellar_amount(amount: Decimal | float | int | str) -> str:
+    """Serialize an on-chain Stellar amount as a string with exactly 7 decimal places."""
+    d = to_stellar_amount(amount)
+    return f"{d.quantize(_SEVEN_DECIMALS):f}"
 
 
 class StellarKit:
@@ -26,17 +74,36 @@ class StellarKit:
 
     Read operations use Stellar Horizon (public, no key needed).
     Write operations are forwarded to Web, which handles signing.
+
+    A single :class:`httpx.AsyncClient` is created during :meth:`initialize`
+    and reused across all Horizon requests so that connection pooling and TLS
+    sessions are shared.  The client is closed in :meth:`close`, which must
+    be awaited during graceful shutdown.
     """
 
-    def __init__(self, api_client: Any):
+    def __init__(self, api_client: Any, *, horizon_timeout: float = _DEFAULT_HORIZON_TIMEOUT):
         self._api = api_client
         self._initialized = False
+        self._horizon_timeout = horizon_timeout
+        self._client: httpx.AsyncClient | None = None
 
     async def initialize(self) -> None:
         if self._initialized:
             return
+        self._client = httpx.AsyncClient(timeout=self._horizon_timeout)
         self._initialized = True
         console.print("[green]Stellar proxy ready (via Web API + Horizon).[/green]")
+
+    async def close(self) -> None:
+        """Close the shared Horizon HTTP client.
+
+        Must be awaited during graceful shutdown to avoid unclosed-client
+        warnings and to release the underlying connection pool cleanly.
+        """
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        self._initialized = False
 
     @property
     def available(self) -> bool:
@@ -56,49 +123,91 @@ class StellarKit:
             acct = account_id or (talos.get("stellarAccountId", "") if talos else "")
             if not acct:
                 return {"error": "No Stellar account configured"}
-            # Horizon is public — no auth needed
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            if not _validate_account_id(acct):
+                return {"error": "invalid_account", "account": acct}
+            # Reuse the shared client; fall back to a temporary one if not
+            # initialized (e.g. called in tests without initialize()).
+            client = self._client or httpx.AsyncClient(timeout=self._horizon_timeout)
+            close_after = self._client is None
+            try:
                 r = await request_with_retry(
                     lambda: client.get(f"{_HORIZON_URL}/accounts/{acct}"),
                     provider="talos_web_api",
                 )
-                if r.status_code == 200:
-                    data = r.json()
-                    balance = data.get("balances", [])
-                    xlm_balance = next((b for b in balance if b.get("asset_type") == "native"), None)
-                    if xlm_balance:
-                        return {"balance_xlm": float(xlm_balance["balance"]), "account": acct}
-                    return {"balance_xlm": 0, "account": acct}
-            return {"error": "Horizon query failed"}
-        except Exception as e:
-            return {"error": f"Balance query failed: {e}"}
+            finally:
+                if close_after:
+                    await client.aclose()
+            if r.status_code == 200:
+                data = r.json()
+                balance = data.get("balances", [])
+                xlm_balance = next((b for b in balance if b.get("asset_type") == "native"), None)
+                if xlm_balance:
+                    return {"balance_xlm": float(xlm_balance["balance"]), "account": acct}
+                return {"balance_xlm": 0, "account": acct}
+            return attach_stellar_failure(
+                None,
+                classify_stellar_failure(status_code=r.status_code),
+            )
+        except Exception as exc:
+            return attach_stellar_failure(
+                None,
+                classify_stellar_failure(exc=exc),
+            )
 
     async def get_token_balance(self, account_id: str, token_id: str) -> dict[str, Any]:
         """Query Stellar asset balance via Horizon."""
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            if not _validate_account_id(account_id):
+                return {"error": "invalid_account", "account": account_id}
+            client = self._client or httpx.AsyncClient(timeout=self._horizon_timeout)
+            close_after = self._client is None
+            try:
                 r = await request_with_retry(
                     lambda: client.get(f"{_HORIZON_URL}/accounts/{account_id}"),
                     provider="talos_web_api",
                 )
-                if r.status_code == 200:
-                    data = r.json()
-                    balances = data.get("balances", [])
-                    token_balance = next((b for b in balances if b.get("asset_code") == token_id), None)
-                    balance = float(token_balance["balance"]) if token_balance else 0
-                    return {"balance": balance, "token_id": token_id, "account": account_id}
-            return {"error": "Horizon query failed"}
-        except Exception as e:
-            return {"error": f"Token balance query failed: {e}"}
-
-    async def transfer_xlm(self, to_account: str, amount: float) -> dict[str, Any]:
-        """Request XLM transfer via Web API (Web handles signing)."""
-        try:
-            result = await self._api.request_transfer(
-                to_account=to_account, amount=amount, currency="XLM"
+            finally:
+                if close_after:
+                    await client.aclose()
+            if r.status_code == 200:
+                data = r.json()
+                balances = data.get("balances", [])
+                token_balance = next((b for b in balances if b.get("asset_code") == token_id), None)
+                balance = float(token_balance["balance"]) if token_balance else 0
+                return {"balance": balance, "token_id": token_id, "account": account_id}
+            return attach_stellar_failure(
+                None,
+                classify_stellar_failure(status_code=r.status_code),
             )
-            if result:
-                return {"status": "submitted", "to": to_account, "amount": amount}
-            return {"error": "Transfer request failed"}
-        except Exception as e:
-            return {"error": f"Transfer failed: {e}"}
+        except Exception as exc:
+            return attach_stellar_failure(
+                None,
+                classify_stellar_failure(exc=exc),
+            )
+
+    async def transfer_xlm(self, to_account: str, amount: Decimal | float | str) -> dict[str, Any]:
+        """Request XLM transfer via Web API (Web handles signing).
+
+        On failure the returned dict carries ``error`` plus the bounded
+        classification fields (``failure_class``, ``failure_code``,
+        ``retryable``, ``indeterminate``, ``terminal``).  On success it keeps
+        the historical ``{"status": "submitted", ...}`` shape.
+        """
+        try:
+            dec_amount = to_stellar_amount(amount)
+            formatted_amount = format_stellar_amount(dec_amount)
+            result = await self._api.request_transfer(
+                to_account=to_account, amount=formatted_amount, currency="XLM"
+            )
+        except Exception as exc:
+            return attach_stellar_failure(None, classify_stellar_failure(exc=exc))
+
+        failure = classify_stellar_result(result)
+        if failure is not None:
+            return attach_stellar_failure(result, failure)
+
+        if result:
+            return {"status": "submitted", "to": to_account, "amount": formatted_amount}
+
+        # Empty response with no error payload — surface an unclassified failure.
+        return attach_stellar_failure(None, classify_stellar_failure())
