@@ -146,6 +146,103 @@ export type ResolvedRetryPolicy = Readonly<Required<RetryPolicyOptions>>;
 /** Frozen snapshot of the effective typed retry policy. */
 export type ResolvedRetryOptions = Readonly<Required<RetryOptions>>;
 
+// ─── ETag cache ────────────────────────────────────────────────────────────
+
+/**
+ * A single entry in the ETag cache.
+ *
+ * @internal
+ */
+export interface ETagCacheEntry<T = unknown> {
+  /** The ETag value returned by the server (e.g. `"abc123"`). */
+  etag: string;
+  /** The cached response body. */
+  body: T;
+}
+
+/**
+ * Pluggable ETag store interface.
+ *
+ * The default implementation is an LRU-bounded in-memory map. Provide your
+ * own to persist across sessions, share across workers, etc.
+ */
+export interface ETagStore {
+  /** Retrieve a cache entry for the given key, or `undefined` on a miss. */
+  get(key: string): ETagCacheEntry | undefined;
+  /** Store a cache entry. */
+  set(key: string, entry: ETagCacheEntry): void;
+  /** Remove a cache entry (called when the server returns a non-304 / non-2xx on a conditional request). */
+  delete(key: string): void;
+}
+
+/**
+ * Options for the opt-in ETag conditional-GET feature.
+ *
+ * When {@link TalosClientOptions.etagCache} is `true` (or this object),
+ * GET requests will:
+ * 1. Send `If-None-Match: <etag>` when a cached ETag exists for the URL.
+ * 2. Return the cached body transparently on `304 Not Modified`.
+ * 3. Update the cache (ETag + body) on `2xx` responses that carry an `ETag`
+ *    header.
+ *
+ * **Scope**: only GET requests are ever cached. The cache key is
+ * `<url>\n<auth-identity>` so different API keys have isolated caches.
+ *
+ * **Disabled by default** — pass `true` or this object to opt in.
+ */
+export interface ETagCacheOptions {
+  /**
+   * Maximum number of entries in the built-in in-memory LRU store. Entries
+   * are evicted in insertion order once the limit is reached. Default 512.
+   * Ignored when `store` is provided.
+   */
+  maxEntries?: number;
+  /**
+   * Bring-your-own ETag store. When provided the `maxEntries` option is
+   * ignored.
+   */
+  store?: ETagStore;
+  /**
+   * Optional observer invoked each time a 304 response returns the cached
+   * body. Must not throw; invoked fire-and-forget.
+   */
+  onCacheHit?: (event: { url: string; etag: string }) => void;
+}
+
+/**
+ * A simple insertion-order LRU map bounded to `maxEntries`.
+ *
+ * @internal
+ */
+class BoundedETagStore implements ETagStore {
+  private readonly map = new Map<string, ETagCacheEntry>();
+  constructor(private readonly maxEntries: number) {}
+
+  get(key: string): ETagCacheEntry | undefined {
+    return this.map.get(key);
+  }
+
+  set(key: string, entry: ETagCacheEntry): void {
+    // Move to tail on update.
+    if (this.map.has(key)) this.map.delete(key);
+    // Evict the oldest (head) entry when at capacity.
+    if (this.map.size >= this.maxEntries) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    this.map.set(key, entry);
+  }
+
+  delete(key: string): void {
+    this.map.delete(key);
+  }
+
+  /** Number of entries currently in the store (for tests/observability). */
+  get size(): number {
+    return this.map.size;
+  }
+}
+
 /**
  * Options for the opt-in in-flight GET deduplication feature.
  *
@@ -286,6 +383,37 @@ export interface ReadOptions {
    * regardless of the client default. Surfaces as `TalosTimeoutError`.
    */
   timeoutMs?: number;
+}
+
+/**
+ * Options for {@link TalosClient.waitForJobResult}.
+ *
+ * Polls `getJobResult` with exponential backoff + jitter until the job
+ * reaches a terminal state (`completed`, `failed`, or `cancelled`), a
+ * caller-supplied `signal` is aborted, or `timeoutMs` elapses.
+ */
+export interface WaitForJobResultOptions {
+  /**
+   * Initial polling interval in milliseconds. Default 500.
+   * Doubles on each poll up to `maxIntervalMs`.
+   */
+  intervalMs?: number;
+  /**
+   * Upper bound on the polling interval in milliseconds. Default 10_000.
+   * `Retry-After` headers from 429 responses are capped here too.
+   */
+  maxIntervalMs?: number;
+  /**
+   * Overall wall-clock timeout in milliseconds for the entire wait loop.
+   * Surfaces as {@link TalosTimeoutError} when exceeded. No default (waits
+   * indefinitely unless a signal is also provided).
+   */
+  timeoutMs?: number;
+  /**
+   * Caller-supplied AbortSignal. Aborting cancels the next scheduled poll
+   * and rejects the promise with {@link TalosTimeoutError}.
+   */
+  signal?: AbortSignal;
 }
 
 /** Structured event emitted to {@link TalosClientOptions.onError}. */
@@ -1073,6 +1201,16 @@ export class TalosClient {
       extraHeaders["Idempotency-Key"] = validateIdempotencyKey(idempotencyKey);
     }
 
+    // ── ETag conditional-GET ──────────────────────────────────
+    const cacheKey = this.etagCacheKey(method, url);
+    let cachedEntry: ETagCacheEntry | undefined;
+    if (cacheKey !== null && this.etagStore) {
+      cachedEntry = this.etagStore.get(cacheKey);
+      if (cachedEntry) {
+        extraHeaders["If-None-Match"] = cachedEntry.etag;
+      }
+    }
+
     // A keyed write is de-duplicated server-side, so it becomes retry-eligible.
     const idempotent = IDEMPOTENT_METHODS.has(method) || idempotencyKey !== undefined;
     const retryMethodsForCall =
@@ -1116,7 +1254,22 @@ export class TalosClient {
 
         if (res.ok) {
           // Malformed JSON on a 2xx intentionally propagates the raw parse error.
-          return (await res.json()) as T;
+          const body = (await res.json()) as T;
+
+          // Update ETag cache if the server returned an ETag header.
+          if (cacheKey !== null && this.etagStore) {
+            const etag = res.headers.get("ETag") ?? res.headers.get("etag");
+            if (etag) {
+              this.etagStore.set(cacheKey, { etag, body });
+            }
+          }
+
+          return body;
+        }
+
+        // Non-2xx, non-304: evict stale cache entry if present.
+        if (cacheKey !== null && this.etagStore) {
+          this.etagStore.delete(cacheKey);
         }
 
         const rawBody = await res.text().catch(() => "");
@@ -1624,6 +1777,121 @@ export class TalosClient {
       `/api/talos/${encodeURIComponent(talosId)}/jobs/${encodeURIComponent(jobId)}/payment-status`,
       { signal: options?.signal, timeoutMs: options?.timeoutMs },
     );
+  }
+
+  /**
+   * Poll `getJobResult` with exponential back-off and jitter until the job
+   * reaches a terminal state or the timeout / abort fires.
+   *
+   * Resolution rules:
+   *   - `completed`  → resolves with the {@link CommerceJob}
+   *   - `failed`     → rejects with the {@link CommerceJob} as the `cause`
+   *                    inside a {@link TalosAPIError}
+   *   - `cancelled`  → same as `failed`
+   *   - Timeout      → rejects with {@link TalosTimeoutError}
+   *   - Abort signal → rejects with {@link TalosTimeoutError}
+   *
+   * Network errors from `getJobResult` are surfaced immediately without
+   * retry (the outer retry policy on the client handles those individually).
+   *
+   * After the promise settles (any outcome) **no timers remain running**.
+   *
+   * @param jobId   - Job ID to poll.
+   * @param options - Polling configuration (intervals, timeout, signal).
+   */
+  async waitForJobResult(
+    jobId: string,
+    options: WaitForJobResultOptions = {},
+  ): Promise<CommerceJob> {
+    const {
+      intervalMs = 500,
+      maxIntervalMs = 10_000,
+      timeoutMs,
+      signal: callerSignal,
+    } = options;
+
+    const path = `/api/jobs/${jobId}/result`;
+
+    // Reject immediately if the signal is already aborted.
+    if (callerSignal?.aborted) {
+      throw new TalosTimeoutError(0, "Request aborted", path, {
+        message: "waitForJobResult aborted before starting",
+      });
+    }
+
+    // Optional wall-clock deadline.
+    const deadline = timeoutMs != null ? Date.now() + timeoutMs : null;
+
+    // Abort controller for the overall wait. Linked to both the caller's
+    // signal (if any) and the optional wall-clock deadline timer.
+    const loopController = new AbortController();
+    const loopSignal = loopController.signal;
+
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let abortReason: "timeout" | "signal" | undefined;
+
+    const onCallerAbort = () => {
+      abortReason = "signal";
+      loopController.abort();
+    };
+
+    if (deadline !== null) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new TalosTimeoutError(0, `Job ${jobId} wait timed out`, path, {
+          message: `waitForJobResult timed out after ${timeoutMs}ms`,
+        });
+      }
+      deadlineTimer = setTimeout(() => {
+        abortReason = "timeout";
+        loopController.abort();
+      }, remaining);
+    }
+
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+
+    try {
+      let currentIntervalMs = Math.max(0, intervalMs);
+
+      while (true) {
+        // Check abort before every poll.
+        if (loopSignal.aborted) {
+          const reason = abortReason === "timeout"
+            ? `waitForJobResult timed out after ${timeoutMs}ms`
+            : "waitForJobResult aborted";
+          throw new TalosTimeoutError(0, reason, path, { message: reason });
+        }
+
+        // Perform a single poll. Respect the loopSignal so an abort during
+        // the network call surfaces promptly.
+        const job = await this.getJobResult(jobId, { signal: loopSignal });
+
+        if (job.status === "completed") {
+          return job;
+        }
+
+        if (job.status === "failed" || job.status === "cancelled") {
+          throw new TalosAPIError(0, `Job ${jobId} ended with status: ${job.status}`, path, {
+            message: `Job ${jobId} ended with status: ${job.status}`,
+            code: "api_error",
+            cause: job,
+          });
+        }
+
+        // Job is still pending. Wait before the next poll.
+        await this.wait(currentIntervalMs, loopSignal);
+
+        // Exponential back-off capped at maxIntervalMs, with jitter.
+        currentIntervalMs = Math.min(
+          Math.round(currentIntervalMs * 2 * (0.75 + 0.25 * Math.random())),
+          maxIntervalMs,
+        );
+      }
+    } finally {
+      // Always clear timers and listeners so nothing leaks.
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    }
   }
 
   // ── Leaderboard ────────────────────────────────────────────

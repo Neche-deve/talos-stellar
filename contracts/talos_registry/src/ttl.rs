@@ -1,9 +1,4 @@
 //! Soroban storage TTL management helpers for TalosRegistry.
-//!
-//! Wraps `ttl_manager` for the Talos-specific storage layout. The
-//! entry-points (`touch_talos`, `touch_batch`, `extend_ttl_batch`,
-//! `get_storage_health`) live in `lib.rs`; they delegate the inner sweep
-//! logic here to keep `lib.rs` focused on authorization and dispatch.
 
 use soroban_sdk::Env;
 use ttl_manager;
@@ -11,7 +6,7 @@ use ttl_manager;
 use crate::{DataKey, Talos};
 
 /// Re-write a single Talos entry to reset its Soroban TTL if it has not
-/// been touched recently (as determined by `ttl_manager::needs_touch`).
+/// been touched recently.
 ///
 /// Returns `true` if the write was performed, `false` if skipped.
 ///
@@ -42,10 +37,9 @@ pub(crate) fn touch_talos_inner(e: &Env, talos_id: u32) -> bool {
 
 /// Shared bounded sweep behind `touch_batch` / `extend_ttl_batch`.
 ///
-/// Re-writes each Talos in `range` (bumping its Soroban TTL) when its age
-/// falls inside `bounds`, refreshes the matching `LastTouched` marker,
-/// emits `ttl_batch`, and returns `(touched, skipped)`. IDs without a
-/// record are neither touched nor skipped (matches historical behaviour).
+/// Re-writes each Talos in `range` when its age falls inside `bounds`,
+/// refreshes the matching `LastTouched` marker, emits `ttl_batch`,
+/// and returns `(touched, skipped)`.
 pub(crate) fn sweep_talos_ttl(
     e: &Env,
     bounds: &ttl_manager::TtlBounds,
@@ -85,7 +79,7 @@ pub(crate) fn sweep_talos_ttl(
 }
 
 /// Compute storage health by comparing per-entry ages against warn/crit
-/// thresholds and returning `(min_age, max_age, keys_below_warn, keys_below_crit, total)`.
+/// thresholds. Returns `(min_age, max_age, keys_below_warn, keys_below_crit, total)`.
 /// Emits `ttl_warn` if any entry is at or below the critical threshold.
 pub(crate) fn storage_health(e: &Env, next_id: u32) -> (u32, u32, u32, u32, u32) {
     let mut health = ttl_manager::KeyHealth::empty();

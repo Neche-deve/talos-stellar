@@ -1,7 +1,7 @@
 //! TalosRegistry inline tests, extracted from lib.rs.
 //!
 //! All test helpers and test functions are collected here; logical groupings
-//! are preserved via `// ── ... ──` section comments.
+//! are preserved via // ── ... ── section comments.
 
 use crate::*;
 use soroban_sdk::{
@@ -3864,3 +3864,4 @@ fn operations_on_deactivated_talos_still_require_auth() {
     // Attempting update_kernel on a deactivated talos without auth must fail
     assert!(client.try_update_kernel(&id, &kernel()).is_err());
 }
+

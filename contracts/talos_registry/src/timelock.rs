@@ -1,12 +1,13 @@
 //! Timelock administration helpers for TalosRegistry.
 //!
-//! Provides the data types and pure-logic helpers used by the timelock
-//! entry-points (`set_timelock_config`, `schedule_action`, `execute_action`,
-//! `cancel_action`, `get_timelock_proposal`). The actual contract
-//! entry-points live in `lib.rs`; they delegate to these helpers after
-//! performing authorization checks.
+//! Validation logic (`validate_timelock_config`, `validate_delay`,
+//! `validate_executable`) is delegated to `admin_controls` to avoid
+//! duplication with `TalosNameService`. Event emission for timelock events
+//! is handled by `crate::events`.
 
 use soroban_sdk::{Address, Env};
+
+use admin_controls;
 
 use crate::{
     events::{
@@ -14,7 +15,7 @@ use crate::{
         emit_timelock_scheduled,
     },
     AdminAction, DataKey, ProposalStatus, TimelockConfig, TimelockProposal,
-    DEFAULT_GRACE_PERIOD, MAX_MIN_DELAY,
+    DEFAULT_GRACE_PERIOD,
 };
 
 /// Read the current timelock config from storage, returning a safe default
@@ -30,29 +31,25 @@ pub(crate) fn get_timelock_config(e: &Env) -> TimelockConfig {
 }
 
 /// Validate and persist a new timelock config, then emit `tl_cfg`.
+/// Delegates constraint checks to `admin_controls::validate_timelock_config`.
 pub(crate) fn set_timelock_config_internal(e: &Env, min_delay: u64, grace_period: u64) {
-    if grace_period == 0 {
-        panic!("Grace period must be positive");
-    }
-    if min_delay > MAX_MIN_DELAY {
-        panic!("Min delay exceeds maximum limit");
-    }
+    admin_controls::validate_timelock_config(min_delay, grace_period);
 
     let old_config = get_timelock_config(e);
 
-    let new_config = TimelockConfig {
-        min_delay,
-        grace_period,
-    };
-
-    e.storage()
-        .persistent()
-        .set(&DataKey::TimelockConfig, &new_config);
+    e.storage().persistent().set(
+        &DataKey::TimelockConfig,
+        &TimelockConfig {
+            min_delay,
+            grace_period,
+        },
+    );
 
     emit_timelock_config_changed(e, old_config.min_delay, min_delay, grace_period);
 }
 
 /// Create a new timelock proposal, persist it, and emit `tl_sch`.
+/// Delegates delay validation to `admin_controls::validate_delay`.
 /// Returns the new proposal ID.
 pub(crate) fn schedule_action_internal(
     e: &Env,
@@ -61,9 +58,7 @@ pub(crate) fn schedule_action_internal(
     delay: u64,
 ) -> u64 {
     let config = get_timelock_config(e);
-    if delay < config.min_delay {
-        panic!("Delay less than minimum required delay");
-    }
+    admin_controls::validate_delay(delay, &config);
 
     let id: u64 = e
         .storage()
@@ -114,10 +109,10 @@ pub(crate) fn cancel_action_internal(e: &Env, admin: Address, proposal_id: u64) 
     emit_timelock_cancelled(e, proposal_id, &proposal.action, admin);
 }
 
-/// Validate that a proposal has matured and is still within the grace window.
-/// Returns the proposal for the caller to dispatch.
+/// Load a proposal and validate it is within the execution window.
+/// Delegates timing checks to `admin_controls::validate_executable`.
 ///
-/// Panics with descriptive messages on any failure:
+/// # Panics
 /// - `"Timelock proposal not found"` — unknown ID
 /// - `"Proposal not active"` — already executed or cancelled
 /// - `"Timelock delay not met"` — ETA in the future
@@ -133,15 +128,8 @@ pub(crate) fn validate_executable_proposal(e: &Env, proposal_id: u64) -> Timeloc
         panic!("Proposal not active");
     }
 
-    let now = e.ledger().timestamp();
-    if now < proposal.eta {
-        panic!("Timelock delay not met");
-    }
-
     let config = get_timelock_config(e);
-    if now > proposal.eta.saturating_add(config.grace_period) {
-        panic!("Proposal expired");
-    }
+    admin_controls::validate_executable(e, proposal.eta, config.grace_period);
 
     proposal
 }

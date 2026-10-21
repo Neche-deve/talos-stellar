@@ -1,16 +1,17 @@
 //! Emergency pause and guardian helpers for TalosRegistry.
 //!
-//! Exposes pure-logic helpers used by the pause/guardian entry-points in
-//! `lib.rs`. Storage reads and writes happen directly against the ledger;
-//! no caching layer is used so behaviour is identical to the inline code
-//! it replaces.
+//! Guardian list storage lives under `DataKey::Guardians`. The guardian
+//! add/remove/check logic is delegated to `admin_controls` to avoid
+//! duplication with `TalosNameService`. Domain pause state is stored under
+//! `DataKey::PauseState(PauseDomain)` and handled locally here.
 
 use soroban_sdk::{Address, Env, Vec};
 
+use admin_controls;
+
 use crate::{
-    events::{emit_guardian_added, emit_guardian_removed, emit_pause_cleared, emit_pause_set},
+    events::{emit_pause_cleared, emit_pause_set},
     DataKey, PauseDomain, PauseInfo, PauseState,
-    MAX_ADMIN_PAUSE_SECS, MAX_GUARDIANS, MAX_GUARDIAN_PAUSE_SECS,
 };
 
 // ── Guardian helpers ─────────────────────────────────────────────────
@@ -23,45 +24,8 @@ pub(crate) fn get_guardians(e: &Env) -> Vec<Address> {
 }
 
 pub(crate) fn is_guardian_internal(e: &Env, addr: &Address) -> bool {
-    get_guardians(e).iter().any(|g| g == *addr)
-}
-
-/// Add `guardian` to the registered set, emitting `guard_add`.
-/// Idempotent: adding an already-registered guardian is a no-op.
-///
-/// # Panics
-/// - `"Guardian limit reached"` — when the set already holds [`MAX_GUARDIANS`].
-pub(crate) fn add_guardian_internal(e: &Env, guardian: Address) {
-    let mut guardians = get_guardians(e);
-    if guardians.iter().any(|g| g == guardian) {
-        return;
-    }
-    if guardians.len() >= MAX_GUARDIANS {
-        panic!("Guardian limit reached");
-    }
-    guardians.push_back(guardian.clone());
-    e.storage().persistent().set(&DataKey::Guardians, &guardians);
-    emit_guardian_added(e, guardian);
-}
-
-/// Remove `guardian` from the registered set, emitting `guard_rem`.
-/// Idempotent: removing a non-existent address is a no-op.
-pub(crate) fn remove_guardian_internal(e: &Env, guardian: Address) {
     let guardians = get_guardians(e);
-    let mut remaining = Vec::new(e);
-    let mut found = false;
-    for g in guardians.iter() {
-        if g == guardian {
-            found = true;
-            continue;
-        }
-        remaining.push_back(g);
-    }
-    if !found {
-        return;
-    }
-    e.storage().persistent().set(&DataKey::Guardians, &remaining);
-    emit_guardian_removed(e, guardian);
+    admin_controls::is_guardian(&guardians, addr)
 }
 
 // ── Domain pause helpers ─────────────────────────────────────────────
@@ -79,24 +43,10 @@ pub(crate) fn is_domain_paused(e: &Env, domain: &PauseDomain) -> bool {
     }
 }
 
-/// Panic with `"Write path paused"` if `domain` is currently paused.
-#[allow(dead_code)]
-pub(crate) fn require_not_paused(e: &Env, domain: PauseDomain) {
-    if is_domain_paused(e, &domain) {
-        panic!("Write path paused");
-    }
-}
-
 /// Apply a pause to `domain` on behalf of `caller`.
 ///
-/// Duration semantics:
-/// - Admin (`is_admin_caller = true`): `duration = 0` → indefinite; non-zero
-///   must be ≤ [`MAX_ADMIN_PAUSE_SECS`].
-/// - Guardian (`is_admin_caller = false`): `duration` must be 1..=
-///   [`MAX_GUARDIAN_PAUSE_SECS`] — guardians can never impose indefinite pauses.
-///
-/// Idempotent: calling again overwrites the existing record, **except** that a
-/// guardian cannot overwrite a pause the admin established.
+/// Duration semantics are enforced by `admin_controls::compute_expires_at`.
+/// A guardian cannot overwrite a pause that the admin established.
 ///
 /// # Panics
 /// - `"Domain locked by admin; guardians cannot modify"` — guardian tried to
@@ -122,21 +72,7 @@ pub(crate) fn apply_pause(
     }
 
     let now = e.ledger().timestamp();
-    let expires_at = if is_admin_caller {
-        if duration == 0 {
-            0
-        } else {
-            if duration > MAX_ADMIN_PAUSE_SECS {
-                panic!("Duration exceeds admin maximum");
-            }
-            now.saturating_add(duration)
-        }
-    } else {
-        if duration == 0 || duration > MAX_GUARDIAN_PAUSE_SECS {
-            panic!("Guardian pause duration out of bounds");
-        }
-        now.saturating_add(duration)
-    };
+    let expires_at = admin_controls::compute_expires_at(e, is_admin_caller, duration);
 
     e.storage().persistent().set(
         &key,
