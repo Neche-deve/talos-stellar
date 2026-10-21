@@ -22,40 +22,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from talos_agent.circuit_breaker import CircuitBreakerRegistry
+from talos_agent.redact import is_sensitive_key as _is_sensitive_key
 
 logger = logging.getLogger(__name__)
 
 # ── Sensitive-field matchers ──────────────────────────────────────────────────
-# Substrings (lowercase) that cause a metric label or value to be redacted.
-_SENSITIVE_LABEL_TOKENS = frozenset(
-    {
-        "api_key",
-        "api key",
-        "apikey",
-        "secret",
-        "token",
-        "password",
-        "private_key",
-        "private key",
-        "signature",
-        "stellar_secret",
-        "wallet_secret",
-        "prompt",
-        "user_prompt",
-        "system_prompt",
-        "seed",
-        "mnemonic",
-        "payment_proof",
-        "proof",
-    }
-)
-
-
-def _is_sensitive_key(key: str) -> bool:
-    """Return True if *key* suggests a sensitive dimension value."""
-    lower = key.lower()
-    return any(tok in lower for tok in _SENSITIVE_LABEL_TOKENS)
-
+# Delegated to the canonical redact module — kept here as re-exports for
+# backward compatibility with callers that import from telemetry.
 
 def _redact_if_sensitive(label: str, value: object) -> object:
     """Return ``"[REDACTED]"`` if *label* indicates a sensitive field."""

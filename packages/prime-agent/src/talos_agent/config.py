@@ -72,8 +72,16 @@ class Settings(BaseSettings):
 
     @property
     def llm_api_key(self) -> str:
+        override = self.__dict__.get("_llm_api_key_override")
+        if override is not None:
+            return override
         groq_key = self.secret_value("groq_api_key")
         return groq_key or self.secret_value("openai_api_key")
+
+    @llm_api_key.setter
+    def llm_api_key(self, value: str) -> None:
+        """Allow runtime credential revocation (lifecycle pause/shutdown)."""
+        self.__dict__["_llm_api_key_override"] = value
 
     @property
     def llm_model(self) -> str:
@@ -139,6 +147,23 @@ class Settings(BaseSettings):
     )
 
 
+    # API client response size cap (Issue #561)
+    # Hard upper bound on response bodies read from the Talos Web API.  Defaults
+    # to 1 MiB — large enough for any legitimate JSON payload and small enough to
+    # prevent memory exhaustion from oversized or malicious responses.
+    api_client_response_max_bytes: int = Field(
+        default=1_048_576,
+        ge=1_024,
+        le=104_857_600,
+        validation_alias="TALOS_API_CLIENT_RESPONSE_MAX_BYTES",
+        description=(
+            "Maximum bytes allowed in a Talos Web API response body. "
+            "Responses that exceed this limit are rejected with "
+            "ResponseTooLargeError before the body is decoded. "
+            "Default 1 MiB. Min 1 KiB, max 100 MiB."
+        ),
+    )
+
     # X (Twitter)
     x_username: str = ""
     x_password: str = ""
@@ -157,6 +182,11 @@ class Settings(BaseSettings):
     channel_configs: dict = Field(default_factory=dict, description="Per-channel credentials map")
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    telegram_parse_mode: str = Field(
+        default="none",
+        description="Telegram message parse mode: none, HTML, or MarkdownV2.",
+        validation_alias="TALOS_TELEGRAM_PARSE_MODE",
+    )
 
     # Telegram send queue (opt-in; when disabled the adapter sends directly, as before).
     # Defaults follow Telegram's documented limits: ~1 msg/s per chat, 20 msgs/min per group.
@@ -285,6 +315,19 @@ class Settings(BaseSettings):
     # Policy engine (disabled by default — backward compatible)
     policy_engine_enabled: bool = Field(default=False, description="Enable the declarative policy engine for autonomous actions")
 
+    # Demo commerce mode (Issue #879) — disabled by default.
+    # When enabled, the system prompt includes aggressive purchasing instructions
+    # ("buy immediately", demo-environment notices, BE AGGRESSIVE).
+    # Production deployments must leave this off.
+    demo_commerce_mode: bool = Field(
+        default=False,
+        description=(
+            "Emit aggressive demo-purchasing guidance in the system prompt "
+            "(buy-immediately instructions, demo-environment notice, BE AGGRESSIVE). "
+            "Off by default — safe for production. Enable only for live demos."
+        ),
+    )
+
     # Tool permission manifests (audit-only by default — backward compatible).
     # "off" disables the check entirely, "audit" evaluates and logs without
     # blocking, "enforce" denies calls that exceed their manifest or grants.
@@ -299,7 +342,7 @@ class Settings(BaseSettings):
     polling_interval: int = Field(default=10, description="Seconds between API polls")
     heartbeat_interval: int = Field(default=60, description="Seconds between heartbeats")
     max_iterations: int = Field(default=20, description="Max tool-call iterations per cycle")
-    approval_threshold: Decimal = Field(default=Decimal("10"), description="USD threshold for auto-approval")
+    approval_threshold: Decimal = Field(default=Decimal(10), description="USD threshold for auto-approval")
     browser_headless: bool = Field(default=False, description="Run browser in headless mode")
     auto_repay_loans: bool = Field(default=False, description="Enable automatic loan repayment from treasury")
     tool_timeout_seconds: int = Field(
@@ -308,6 +351,31 @@ class Settings(BaseSettings):
         le=120,
         validation_alias="TALOS_TOOL_TIMEOUT_SECONDS",
         description="Maximum seconds for a single external tool call before it is cancelled.",
+    )
+
+    # Content history and research note bounds (Issue #974)
+    content_history_max_limit: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        validation_alias="TALOS_CONTENT_HISTORY_MAX_LIMIT",
+        description=(
+            "Hard cap on the limit passed to get_content_history. "
+            "LLM-provided values above this are clamped down to it, "
+            "preventing unbounded rows from entering the prompt context."
+        ),
+    )
+    research_notes_max_bytes: int = Field(
+        default=4096,
+        ge=64,
+        le=131072,
+        validation_alias="TALOS_RESEARCH_NOTES_MAX_BYTES",
+        description=(
+            "Maximum byte length of a research note stored via "
+            "save_research_notes. Longer notes are truncated and a "
+            "truncation marker is appended so downstream consumers "
+            "and the audit trail can tell the difference."
+        ),
     )
 
     # Job leasing
@@ -349,6 +417,12 @@ class Settings(BaseSettings):
     talos_job_effect_dispatch_timeout_seconds: int = Field(default=20, ge=1, le=120)
     talos_job_effect_db_timeout_ms: int = Field(default=5_000, ge=1, le=30_000)
 
+    # A2A (Agent-to-Agent) composition timeouts
+    a2a_connect_timeout: float = Field(default=10.0, description="Seconds to wait for A2A TCP connect")
+    a2a_read_timeout: float = Field(default=30.0, description="Seconds to wait for A2A response body")
+    a2a_write_timeout: float = Field(default=10.0, description="Seconds to wait to send A2A request body")
+    a2a_pool_timeout: float = Field(default=5.0, description="Seconds to wait for A2A connection from pool")
+
     # Graceful shutdown (#182)
     shutdown_deadline: float = Field(
         default=30.0,
@@ -360,7 +434,25 @@ class Settings(BaseSettings):
 
     # Dividend distribution
     dividend_distribution_interval: int = Field(default=3600, description="Seconds between dividend distribution checks")
-    dividend_usdc_threshold: Decimal = Field(default=Decimal("100"), description="USDC threshold to trigger dividend distribution")
+    dividend_usdc_threshold: Decimal = Field(default=Decimal(100), description="USDC threshold to trigger dividend distribution")
+
+    # Deterministic replay (disabled by default for safe rollout)
+    replay_enabled: bool = Field(
+        default=False,
+        description="Enable recording of agent cycle events for deterministic replay.",
+    )
+    replay_max_events: int = Field(
+        default=500,
+        description="Maximum events to capture per cycle (excess silently dropped).",
+    )
+    replay_max_payload_bytes: int = Field(
+        default=65536,
+        description="Maximum bytes per event payload; oversized payloads are truncated.",
+    )
+    replay_keep_sessions: int = Field(
+        default=100,
+        description="Number of replay sessions to keep; oldest are pruned automatically.",
+    )
 
     # Execution replay (Issue #235) — disabled by default
     replay_enabled: bool = Field(default=False, description="Enable execution replay recording for incident analysis")

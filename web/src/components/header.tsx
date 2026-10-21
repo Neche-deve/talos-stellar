@@ -4,12 +4,15 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useStellarWallet } from "./providers";
+import { ThemeToggle } from "./theme-toggle";
 
 const NAV_ITEMS = [
   { href: "/agents", label: "Agents", requiresWallet: false },
+  { href: "/marketplace", label: "Marketplace", requiresWallet: false },
   { href: "/activity", label: "Activity", requiresWallet: false },
   { href: "/proposals", label: "Proposals", requiresWallet: false },
   { href: "/playbooks", label: "Playbooks", requiresWallet: false },
+  { href: "/webhooks", label: "Webhooks", requiresWallet: false },
   { href: "/leaderboard", label: "Leaderboard", requiresWallet: false },
   { href: "/docs", label: "Docs", requiresWallet: false, highlight: true },
 ];
@@ -64,6 +67,7 @@ export function Header() {
 
         {/* Right: desktop actions + mobile hamburger */}
         <div className="flex items-center gap-2 sm:gap-3">
+          <ThemeToggle />
           {/* Desktop only */}
           {isConnected && (
             <Link
@@ -95,6 +99,14 @@ export function Header() {
               >
                 {truncatedAddress}
               </span>
+              {publicKey && (
+                <CopyButton
+                  value={publicKey}
+                  label="Copy wallet address"
+                  confirmText="Copied!"
+                  className="px-1.5 py-1"
+                />
+              )}
               <button
                 onClick={disconnect}
                 data-testid="disconnect-wallet-button"
@@ -115,9 +127,19 @@ export function Header() {
 
           {/* Mobile: wallet status pill */}
           {isConnected && (
-            <span className="md:hidden text-xs font-mono text-nav-foreground bg-surface border border-border px-2 py-1">
-              {truncatedAddress}
-            </span>
+            <div className="md:hidden flex items-center gap-1">
+              <span className="text-xs font-mono text-nav-foreground bg-surface border border-border px-2 py-1">
+                {truncatedAddress}
+              </span>
+              {publicKey && (
+                <CopyButton
+                  value={publicKey}
+                  label="Copy wallet address"
+                  confirmText="Copied!"
+                  size="sm"
+                />
+              )}
+            </div>
           )}
 
           {/* Hamburger */}
