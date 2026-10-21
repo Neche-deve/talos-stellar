@@ -12,21 +12,19 @@ import {
   TALOS_NAME_SERVICE_CONTRACT_ID,
 } from "@/lib/soroban";
 import { OPERATOR_PUBLIC_KEY } from "@/lib/stellar-config";
-import {
-  type LaunchFormState,
-  LAUNCH_FORM_DEFAULTS,
-  buildCreateTalosPayload,
-  canNextForStep,
-} from "@/lib/schemas";
-import {
-  StepProduct,
-  StepPatron,
-  StepMitos,
-  StepKernel,
-  StepAgent,
-  StepReview,
-  LaunchStepper,
-} from "./steps";
+import { TALOS_NAME_MIN_LENGTH, TALOS_NAME_MAX_LENGTH } from "@/lib/limits";
+
+
+const STEPS = [
+  "Product",
+  "Patron",
+  "Mitos",
+  "Kernel",
+  "Agent",
+  "Review",
+] as const;
+
+const CHANNELS = ["X (Twitter)", "LinkedIn", "Reddit", "Product Hunt"];
 
 export default function LaunchPage() {
   return (
@@ -69,8 +67,13 @@ function LaunchForm() {
 
   const checkNameAvailability = useCallback((name: string) => {
     if (nameCheckTimer.current) clearTimeout(nameCheckTimer.current);
-    if (!name || name.length < 3) {
+    if (!name || name.length < TALOS_NAME_MIN_LENGTH) {
       setNameAvailable(null);
+      setNameChecking(false);
+      return;
+    }
+    if (name.length > TALOS_NAME_MAX_LENGTH) {
+      setNameAvailable(false);
       setNameChecking(false);
       return;
     }
@@ -95,7 +98,35 @@ function LaunchForm() {
     }, 400);
   }, []);
 
-  const canNext = () => canNextForStep(step, form, nameAvailable);
+  const canNext = () => {
+    switch (step) {
+      case 0:
+        return form.productName && form.productDesc;
+      case 1:
+        return true;
+      case 2: {
+        const sym = form.tokenSymbol.trim();
+        const supply = Number(form.totalSupply);
+        const price = Number(form.initialPrice);
+        return (
+          form.tokenName.trim().length > 0 &&
+          sym.length >= 2 && sym.length <= 8 &&
+          /^[A-Za-z][A-Za-z0-9]*$/.test(sym) &&
+          supply > 0 && supply <= 100_000_000 &&
+          price > 0 && price <= 1_000_000
+        );
+      }
+      case 3:
+        return form.approvalThreshold && form.gtmBudget;
+      case 4:
+        return form.persona && form.targetAudience && form.channels.length > 0
+          && form.agentName.length >= TALOS_NAME_MIN_LENGTH
+          && form.agentName.length <= TALOS_NAME_MAX_LENGTH
+          && nameAvailable === true;
+      default:
+        return true;
+    }
+  };
 
   const handleLaunch = async () => {
     if (!address) return;
@@ -530,7 +561,233 @@ function LaunchForm() {
 
       {/* Step content */}
       <div className="bg-surface border border-border p-8 mb-6">
-        {stepContent[step]}
+        {step === 0 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Product Input</h2>
+            <p className="text-sm text-muted mb-6">
+              Register your product. Your Prime Agent will handle GTM and service delivery.
+            </p>
+            <Field label="Product Name" value={form.productName} onChange={(v) => update("productName", v)} placeholder="e.g. ImageGen Pro" />
+            <Field label="Description" value={form.productDesc} onChange={(v) => update("productDesc", v)} placeholder="What does your product do? Who is it for?" multiline />
+            <div>
+              <label className="block text-xs text-muted mb-2">Category</label>
+              <select
+                value={form.category}
+                onChange={(e) => update("category", e.target.value)}
+                data-testid="launch-input-category"
+                className="w-full bg-background border border-border px-4 py-2.5 text-sm text-foreground focus:outline-none focus:border-accent"
+              >
+                <option value="marketing">Marketing</option>
+                <option value="development">Development</option>
+                <option value="research">Research</option>
+                <option value="design">Design</option>
+                <option value="finance">Finance</option>
+                <option value="analytics">Analytics</option>
+                <option value="operations">Operations</option>
+                <option value="sales">Sales</option>
+                <option value="support">Support</option>
+                <option value="education">Education</option>
+              </select>
+            </div>
+
+            <div className="pt-4 mt-2 border-t border-border">
+              <div className="text-xs text-accent mb-1">[COMMERCE SERVICE]</div>
+              <p className="text-xs text-muted mb-4">
+                Define the paid service your agent offers to other agents via the x402 protocol. Optional — you can add this later.
+              </p>
+              <div className="space-y-4">
+                <Field label="Service Name" value={form.serviceName} onChange={(v) => update("serviceName", v)} placeholder="e.g. SEO Content Generation" />
+                <Field label="Service Description" value={form.serviceDescription} onChange={(v) => update("serviceDescription", v)} placeholder="What does this service do? What input/output should callers expect?" multiline />
+                <div>
+                  <label className="block text-xs text-muted mb-2">Price per Request (USDC)</label>
+                  <input
+                    type="number"
+                    value={form.servicePrice}
+                    onChange={(e) => update("servicePrice", e.target.value)}
+                    placeholder="e.g. 5.00"
+                    data-testid="launch-input-service-price"
+                    className="w-full bg-background border border-border px-4 py-2.5 text-sm text-foreground placeholder:text-muted/50 focus:outline-none focus:border-accent"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {step === 1 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Patron Configuration</h2>
+            <p className="text-sm text-muted mb-6">
+              The Creator is your Stellar public key. It is permanently linked to this TALOS and cannot be changed.
+            </p>
+            <div>
+              <label className="block text-xs text-muted mb-2">Creator Public Key (Stellar)</label>
+              <div
+                data-testid="creator-wallet-display"
+                className="w-full bg-background border border-border px-4 py-2.5 text-sm text-foreground/70 font-mono select-all break-all"
+              >
+                {form.creatorWallet || address || "—"}
+              </div>
+              <p className="text-xs text-muted mt-1">This Stellar public key will be registered as the TALOS Creator on-chain.</p>
+            </div>
+            <div className="p-4 border border-border bg-background">
+              <div className="text-xs text-accent mb-2">[REVENUE MODEL]</div>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-muted">Agent Treasury</span>
+                  <span className="text-foreground font-medium">100%</span>
+                </div>
+              </div>
+              <p className="text-xs text-muted mt-3">All revenue flows to the Agent Treasury controlled by the Creator.</p>
+            </div>
+          </div>
+        )}
+
+        {step === 2 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Mitos Configuration</h2>
+            <p className="text-sm text-muted mb-6">
+              Configure your TALOS&apos;s Mitos token on Stellar.
+            </p>
+            <Field label="Token Name" value={form.tokenName} onChange={(v) => update("tokenName", v)} placeholder="e.g. ImageGen Mitos" />
+            <div>
+              <Field label="Token Symbol (Stellar Asset Code)" value={form.tokenSymbol} onChange={(v) => update("tokenSymbol", v.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))} placeholder="e.g. IMGS" />
+              <p className="text-xs text-muted mt-1">2-8 characters, letters and numbers only. Used as Stellar asset code.</p>
+            </div>
+            <div>
+              <Field label="Total Supply" value={form.totalSupply} onChange={(v) => update("totalSupply", v)} type="number" />
+              <p className="text-xs text-muted mt-1">Max 100,000,000</p>
+            </div>
+            <div>
+              <Field label="Initial Price (USDC)" value={form.initialPrice} onChange={(v) => update("initialPrice", v)} type="number" />
+              <p className="text-xs text-muted mt-1">Price per Pulse token in USDC on Stellar</p>
+            </div>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Kernel Policy</h2>
+            <p className="text-sm text-muted mb-6">
+              Set the governance rules for your agent.
+            </p>
+            <Field label="Approval Threshold (USDC)" value={form.approvalThreshold} onChange={(v) => update("approvalThreshold", v)} type="number" placeholder="Transactions above this require approval" />
+            <Field label="GTM Budget (USDC/month)" value={form.gtmBudget} onChange={(v) => update("gtmBudget", v)} type="number" placeholder="Monthly budget for GTM activities" />
+          </div>
+        )}
+
+        {step === 4 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Prime Agent Setup</h2>
+            <p className="text-sm text-muted mb-6">
+              Configure your AI agent&apos;s personality and targets.
+            </p>
+            <div>
+              <label className="block text-xs text-muted mb-2">Agent Identity (immutable)</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={form.agentName}
+                  onChange={(e) => {
+                    const v = e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "");
+                    update("agentName", v);
+                    checkNameAvailability(v);
+                  }}
+                  placeholder="e.g. marketbot"
+                  data-testid="launch-input-agent-identity"
+                  className="flex-1 bg-background border border-border px-4 py-2.5 text-sm text-foreground placeholder:text-muted/50 focus:outline-none focus:border-accent"
+                />
+                <span className="text-sm text-muted">.talos</span>
+              </div>
+              <div className="mt-1.5 text-xs">
+                {nameChecking && <span className="text-muted">Checking...</span>}
+                {!nameChecking && nameAvailable === true && form.agentName.length >= TALOS_NAME_MIN_LENGTH && (
+                  <span className="text-accent font-bold">{form.agentName}.talos is available</span>
+                )}
+                {!nameChecking && nameAvailable === false && form.agentName.length <= TALOS_NAME_MAX_LENGTH && (
+                  <span className="text-red-600 font-bold">{form.agentName}.talos is taken</span>
+                )}
+                {!nameChecking && form.agentName.length > TALOS_NAME_MAX_LENGTH && (
+                  <span className="text-red-600 font-bold">Name must be at most {TALOS_NAME_MAX_LENGTH} characters</span>
+                )}
+                {!nameChecking && nameAvailable === null && form.agentName.length > 0 && form.agentName.length < TALOS_NAME_MIN_LENGTH && (
+                  <span className="text-muted">Minimum {TALOS_NAME_MIN_LENGTH} characters</span>
+                )}
+              </div>
+              <p className="text-xs text-muted mt-1">This is your agent&apos;s permanent on-chain identity. It cannot be changed after registration.</p>
+            </div>
+            <Field label="Persona" value={form.persona} onChange={(v) => update("persona", v)} placeholder="e.g. A sharp, witty tech commentator" multiline />
+            <Field label="Target Audience" value={form.targetAudience} onChange={(v) => update("targetAudience", v)} placeholder="e.g. Indie developers building SaaS products" />
+            <div>
+              <label className="block text-xs text-muted mb-2">Tone</label>
+              <select
+                value={form.tone}
+                onChange={(e) => update("tone", e.target.value)}
+                data-testid="launch-input-tone"
+                className="w-full bg-background border border-border px-4 py-2.5 text-sm text-foreground focus:outline-none focus:border-accent"
+              >
+                <option value="professional">Professional</option>
+                <option value="casual">Casual</option>
+                <option value="witty">Witty</option>
+                <option value="technical">Technical</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-2">GTM Channels</label>
+              <div className="flex flex-wrap gap-2">
+                {CHANNELS.map((ch) => (
+                  <button
+                    key={ch}
+                    onClick={() => {
+                      const channels = form.channels.includes(ch)
+                        ? form.channels.filter((c) => c !== ch)
+                        : [...form.channels, ch];
+                      update("channels", channels);
+                    }}
+                    data-testid={`launch-channel-${ch.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
+                    className={`px-3 py-1.5 text-xs border transition-colors ${
+                      form.channels.includes(ch)
+                        ? "border-accent text-accent bg-surface"
+                        : "border-border text-muted hover:text-foreground"
+                    }`}
+                  >
+                    {ch}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {step === 5 && (
+          <div className="space-y-6">
+            <h2 className="text-lg font-bold text-accent mb-1">Review & Deploy</h2>
+            <p className="text-sm text-muted mb-6">
+              Confirm your TALOS configuration before deployment.
+            </p>
+            <div className="space-y-4 text-sm">
+              <ReviewRow label="Product" value={form.productName} />
+              <ReviewRow label="Category" value={form.category} />
+              <ReviewRow label="Token" value={`${form.tokenName} (${form.tokenSymbol})`} />
+              <ReviewRow label="Supply" value={Number(form.totalSupply).toLocaleString()} />
+              <ReviewRow label="Price" value={`$${form.initialPrice}`} />
+              <ReviewRow label="Agent Identity" value={`${form.agentName}.talos`} />
+              <ReviewRow label="Revenue Model" value="100% Agent Treasury (no external distribution)" />
+              <ReviewRow label="Creator (Stellar)" value={form.creatorWallet || address || ""} />
+              <ReviewRow label="Approval" value={`> $${form.approvalThreshold}`} />
+              <ReviewRow label="Budget" value={`$${form.gtmBudget}/mo`} />
+              <ReviewRow label="Persona" value={form.persona} />
+              <ReviewRow label="Audience" value={form.targetAudience} />
+              <ReviewRow label="Channels" value={form.channels.join(", ")} />
+              {form.serviceName && (
+                <>
+                  <ReviewRow label="Service" value={form.serviceName} />
+                  <ReviewRow label="Service Price" value={form.servicePrice ? `${form.servicePrice} USDC` : "—"} />
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Deploy progress */}
